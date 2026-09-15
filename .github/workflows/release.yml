@@ -75,6 +75,12 @@ jobs:
             rust_targets: ''
     runs-on: ${{ matrix.platform }}
 
+    env:
+      # .npmrc 里 @file-service 走私有 Gitea registry，令牌从这个变量展开。
+      # 缺它**不会**报「变量未定义」—— pnpm 只是拿不到 auth header，
+      # 到下载 tgz 那一步才以 ERR_PNPM_FETCH_401 失败。
+      GITEA_PACKAGE_REGISTRY_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -166,6 +172,10 @@ jobs:
     permissions:
       contents: write
 
+    env:
+      # 同桌面 job，见那边的说明
+      GITEA_PACKAGE_REGISTRY_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -217,7 +227,12 @@ jobs:
           distribution: zulu
           java-version: '17'
 
+      # packages 必须显式给：该 action 的默认值是 'tools platform-tools'，
+      # 而 `tools`（旧版 SDK Tools）已被 Google 从仓库下架，用默认值会以
+      # "Failed to find package 'tools'" 直接失败。
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Cache Android NDK
         id: ndk-cache
