@@ -23,6 +23,11 @@ env:
   NDK_VERSION: '30.0.14904198'
   PNPM_VERSION: 10
   NODE_VERSION: lts/*
+  # macOS runner 内存小，Node 默认堆上限落在 ~2GB，而本项目的 vite build 会超过它
+  # （单 chunk 就 4.4MB，外加 file-viewer 的一大批运行时资产），于是 `pnpm build`
+  # 以 exit 134 / "Abort trap: 6" 挂掉。Windows 与 Ubuntu runner 内存更大所以撞不到 ——
+  # 同一条命令在三个平台上两种结果，不显式设死很容易误判成"macOS 特有的构建问题"。
+  NODE_OPTIONS: --max-old-space-size=4096
 
 jobs:
   # ─── 先定版本号：三个 job 都要按它拼 tag 与产物名 ──────────────────
