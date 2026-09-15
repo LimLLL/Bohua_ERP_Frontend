@@ -178,7 +178,12 @@ jobs:
           args: ${{ matrix.args }}
           updaterJsonPreferNsis: true
           retryAttempts: 3
-          renameArtifacts: ${{ env.APP_NAME }}
+          # 刻意**不用** env.APP_NAME：这个值是**直接拼接的前缀**，不是替换，
+          # 也不会补分隔符。productName 是「博华ERP」，打包器把非 ASCII 剥掉后
+          # 文件名已经以 ERP 开头，再前缀 APP_NAME(Bohua_ERP) 就成了
+          # Bohua_ERPERP_0.0.1_x64-setup.exe。用 `Bohua_` 补上那个 ERP 才拼成
+          # Bohua_ERP_0.0.1_x64-setup.exe，与安卓 APK 的命名对齐。
+          renameArtifacts: Bohua_
 
   # ─── 安卓：aarch64 APK ─────────────────────────────────────────────
   build-android:
