@@ -192,10 +192,11 @@ jobs:
           VITE_UPDATE_CHECK_URL=${{ vars.GHPROXY_URL }}${{ github.repository }}/releases/latest/download/latest.json
           ENVEOF
 
-      # 安卓 release 包必须允许明文 HTTP：后端与 File Service 都是 http，
-      # 而 Tauri 模板只给 debug 放行。源码里已经改成 true，这里只是**断言**
-      # 它确实是 true —— 重新 `tauri android init` 会把那处改动冲掉，
-      # 而症状要等装到手机上调接口才会以 ERR_CLEARTEXT_NOT_PERMITTED 出现。
+      # 安卓 release 包必须允许明文 HTTP —— 不是为了后端（后端与 Keycloak 都是 https），
+      # 而是 Keycloak 登录后要把 WebView 导航回应用自己的 http://tauri.localhost，
+      # 那一跳会被 Android 的明文策略拦掉。源码里已经改成 true，这里只是**断言**它确实是
+      # true：症状要等装到手机上**登录**才会出现（首屏正常，一登录白页），
+      # CI 全绿、装得上、打得开，只有登录那一下死掉。
       - name: Assert cleartext traffic is allowed
         run: |
           GRADLE=src-tauri/gen/android/app/build.gradle.kts
