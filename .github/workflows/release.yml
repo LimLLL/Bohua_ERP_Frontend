@@ -1,0 +1,339 @@
+# 博华 ERP 桌面/安卓客户端发布构建。
+#
+# 本仓库**不存源码** —— 源码在自建 Gitea 上，那边打 v* tag 时会把 RELEASE_NOTE.md
+# 推到这里，本工作流监听该文件的变更后反向回 Gitea clone 源码再构建。
+# 这里只需要两样东西：RELEASE_NOTE.md 和本文件。
+#
+# 产出一个 **draft** release。确认无误后手动发布才会生效 —— 客户端的 updater 取的是
+# `releases/latest/download/latest.json`，草稿不算 latest，所以发布前不会推给任何人。
+name: Release Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['RELEASE_NOTE.md']
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  APP_NAME: Bohua_ERP
+  NDK_VERSION: '30.0.14904198'
+  PNPM_VERSION: 10
+  NODE_VERSION: lts/*
+
+jobs:
+  # ─── 先定版本号：三个 job 都要按它拼 tag 与产物名 ──────────────────
+  # 版本号取自源码的 tauri.conf.json，**不是 git tag**。据此拼出的
+  # `app-v<version>` 就是 tauri-action 会创建的 tag，后面两个 job 直接认它，
+  # 不必去 `gh release list` 里猜「哪个 draft 是我的」——那样会挑中历史遗留的草稿。
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - name: Clone source from Gitea
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
+          GITEA_URL: ${{ secrets.GITEA_REPO_URL }}
+        run: git clone --depth 1 "https://${GITEA_TOKEN}@${GITEA_URL#https://}" _source
+
+      - id: v
+        run: |
+          VERSION=$(jq -r .version _source/src-tauri/tauri.conf.json)
+          [ -n "$VERSION" ] && [ "$VERSION" != "null" ] || { echo "::error::无法从 tauri.conf.json 读出 version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=app-v$VERSION"  >> "$GITHUB_OUTPUT"
+          echo "版本 $VERSION → tag app-v$VERSION"
+
+  # ─── 桌面：macOS (arm64 + x86_64) + Windows ────────────────────────
+  build-desktop:
+    needs: resolve-version
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust_targets: aarch64-apple-darwin
+          # - platform: ubuntu-22.04   # 取消注释以启用 Linux 构建
+          #   args: ''
+          #   rust_targets: ''
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            rust_targets: x86_64-apple-darwin
+          # Windows 不传 -c：tauri.windows.conf.json 是**自动查找并合并**的
+          # （tauri-cli load_config：base → read_platform() → --config 覆盖层），
+          # 显式再传一次只是把同一份配置合并两遍。
+          - platform: windows-latest
+            args: ''
+            rust_targets: ''
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone source from Gitea
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
+          GITEA_URL: ${{ secrets.GITEA_REPO_URL }}
+        run: |
+          git clone "https://${GITEA_TOKEN}@${GITEA_URL#https://}" _source
+          rm -rf _source/.git
+          shopt -s dotglob
+          cp -rf _source/* .
+          rm -rf _source
+
+      - name: Create .env
+        shell: bash
+        run: |
+          cat > .env << 'ENVEOF'
+          VITE_KEYCLOAK_URL=${{ secrets.VITE_KEYCLOAK_URL }}
+          VITE_KEYCLOAK_REALM=${{ secrets.VITE_KEYCLOAK_REALM }}
+          VITE_KEYCLOAK_CLIENT_ID=${{ secrets.VITE_KEYCLOAK_CLIENT_ID }}
+          VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }}
+          VITE_FILE_SERVICE_BASE_URL=${{ secrets.VITE_FILE_SERVICE_BASE_URL }}
+          VITE_AG_GRID_LICENSE_KEY=${{ secrets.VITE_AG_GRID_LICENSE_KEY }}
+          VITE_UPDATE_CHECK_URL=${{ vars.GHPROXY_URL }}${{ github.repository }}/releases/latest/download/latest.json
+          ENVEOF
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: desktop-${{ matrix.platform }}-${{ matrix.rust_targets }}
+
+      # Ubuntu only — 取消注释 Linux 构建时需要
+      # - name: Install Linux dependencies
+      #   if: runner.os == 'Linux'
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - run: pnpm install
+
+      - name: Read release notes
+        id: notes
+        shell: bash
+        run: |
+          if [ -f RELEASE_NOTE.md ]; then
+            echo "body<<RELEASE_EOF" >> "$GITHUB_OUTPUT"
+            cat RELEASE_NOTE.md >> "$GITHUB_OUTPUT"
+            echo "RELEASE_EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "body=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: LimLLL/tauri-action-renameArtifacts@v0.5.18
+        env:
+          NODE_ENV: production
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'v__VERSION__'
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+          updaterJsonPreferNsis: true
+          retryAttempts: 3
+          renameArtifacts: ${{ env.APP_NAME }}
+
+  # ─── 安卓：aarch64 APK ─────────────────────────────────────────────
+  build-android:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone source from Gitea
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
+          GITEA_URL: ${{ secrets.GITEA_REPO_URL }}
+        run: |
+          git clone "https://${GITEA_TOKEN}@${GITEA_URL#https://}" _source
+          rm -rf _source/.git
+          shopt -s dotglob
+          cp -rf _source/* .
+          rm -rf _source
+
+      - name: Create .env
+        run: |
+          cat > .env << 'ENVEOF'
+          VITE_KEYCLOAK_URL=${{ secrets.VITE_KEYCLOAK_URL }}
+          VITE_KEYCLOAK_REALM=${{ secrets.VITE_KEYCLOAK_REALM }}
+          VITE_KEYCLOAK_CLIENT_ID=${{ secrets.VITE_KEYCLOAK_CLIENT_ID }}
+          VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }}
+          VITE_FILE_SERVICE_BASE_URL=${{ secrets.VITE_FILE_SERVICE_BASE_URL }}
+          VITE_AG_GRID_LICENSE_KEY=${{ secrets.VITE_AG_GRID_LICENSE_KEY }}
+          VITE_UPDATE_CHECK_URL=${{ vars.GHPROXY_URL }}${{ github.repository }}/releases/latest/download/latest.json
+          ENVEOF
+
+      # 安卓 release 包必须允许明文 HTTP：后端与 File Service 都是 http，
+      # 而 Tauri 模板只给 debug 放行。源码里已经改成 true，这里只是**断言**
+      # 它确实是 true —— 重新 `tauri android init` 会把那处改动冲掉，
+      # 而症状要等装到手机上调接口才会以 ERR_CLEARTEXT_NOT_PERMITTED 出现。
+      - name: Assert cleartext traffic is allowed
+        run: |
+          GRADLE=src-tauri/gen/android/app/build.gradle.kts
+          grep -q 'manifestPlaceholders\["usesCleartextTraffic"\] = "true"' "$GRADLE" \
+            || { echo "::error::$GRADLE 里 defaultConfig 的 usesCleartextTraffic 不是 true，release APK 会被安卓拦掉所有 http 请求"; exit 1; }
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}
+
+      - if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: sdkmanager "ndk;${{ env.NDK_VERSION }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: android
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*') }}
+          restore-keys: gradle-
+
+      - run: pnpm install
+
+      - name: Setup NDK toolchain symlinks
+        run: |
+          TOOLCHAIN="${ANDROID_HOME}/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ln -sf "${TOOLCHAIN}/llvm-ar" "${TOOLCHAIN}/aarch64-linux-android-ar"
+          ln -sf "${TOOLCHAIN}/llvm-ranlib" "${TOOLCHAIN}/aarch64-linux-android-ranlib"
+          ln -sf "${TOOLCHAIN}/llvm-strip" "${TOOLCHAIN}/aarch64-linux-android-strip"
+          echo "${TOOLCHAIN}" >> "$GITHUB_PATH"
+
+      - name: Build APK
+        run: pnpm tauri android build --target aarch64
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+          NODE_ENV: production
+
+      - name: Sign APK
+        run: |
+          # 输出目录名随 tauri-cli 版本变过（universal / arm64…），所以按后缀找而不是写死路径。
+          APK_IN=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
+          [ -n "$APK_IN" ] || { echo "::error::没找到未签名 APK"; exit 1; }
+          echo "找到 $APK_IN"
+
+          echo "${{ secrets.ANDROID_RELEASE_KEYSTORE }}" | base64 -d > release.jks
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort -V | tail -1)
+          "$APKSIGNER" sign \
+            --ks release.jks \
+            --ks-key-alias "${{ secrets.ANDROID_RELEASE_KEY }}" \
+            --ks-pass "pass:${{ secrets.ANDROID_RELEASE_PASSWORD }}" \
+            --key-pass "pass:${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}" \
+            --out "${{ env.APP_NAME }}_${{ needs.resolve-version.outputs.version }}_aarch64.apk" \
+            "$APK_IN"
+          rm -f release.jks
+
+      - name: Upload APK to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          APK="${{ env.APP_NAME }}_${{ needs.resolve-version.outputs.version }}_aarch64.apk"
+
+          # 桌面 job 可能还没建出 release，等它（最长 30 分钟）。
+          # 按确定的 tag 等，不去挑「任意一个 draft」——历史遗留的草稿会被挑中。
+          for i in $(seq 1 60); do
+            gh release view "$TAG" >/dev/null 2>&1 && break
+            echo "⏳ 等待 release $TAG …（$i/60）"
+            sleep 30
+          done
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || { echo "::error::30 分钟后仍未出现 release $TAG，桌面构建大概率失败了"; exit 1; }
+
+          gh release upload "$TAG" "$APK" --clobber
+
+  # ─── 收尾：把安卓平台注入 latest.json，并把下载地址换成代理 ──────────
+  finalize:
+    needs: [resolve-version, build-desktop, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHPROXY_URL: ${{ vars.GHPROXY_URL }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          gh release download "$TAG" -p "latest.json" --clobber \
+            || { echo "::error::release $TAG 里没有 latest.json，updater 将无法工作"; exit 1; }
+
+          # tauri-action 只认它自己构建的桌面目标，安卓要手工补。
+          # signature 留空是**故意的**：安卓走的不是 updater 插件那条验签链路，
+          # 而是前端拉 latest.json 比版本号后跳浏览器下载 APK，
+          # 完整性由 APK 自身的 Android 签名与系统安装器把关。
+          APK_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/Bohua_ERP_${VERSION}_aarch64.apk"
+          jq --arg url "$APK_URL" '.platforms["android-aarch64"] = {"url": $url, "signature": ""}' \
+            latest.json > latest_tmp.json
+          mv latest_tmp.json latest.json
+
+          # 国内直连 GitHub releases 基本拉不动，统一换成代理地址。
+          if [ -n "$GHPROXY_URL" ]; then
+            sed -i "s|https://github.com/|${GHPROXY_URL}|g" latest.json
+            echo "已改写为代理地址：$GHPROXY_URL"
+          fi
+
+          cat latest.json
+
+          gh release delete-asset "$TAG" "latest.json" -y 2>/dev/null || true
+          gh release upload "$TAG" "latest.json"
