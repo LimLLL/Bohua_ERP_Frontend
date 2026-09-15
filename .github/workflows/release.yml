@@ -76,9 +76,15 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     env:
-      # .npmrc 里 @file-service 走私有 Gitea registry，令牌从这个变量展开。
-      # 缺它**不会**报「变量未定义」—— pnpm 只是拿不到 auth header，
-      # 到下载 tgz 那一步才以 ERR_PNPM_FETCH_401 失败。
+      # @file-service 走私有 Gitea registry。
+      #
+      # **只设这个变量不够** —— pnpm 10 拒绝展开项目级 .npmrc 里的凭据类环境变量
+      # （防止被投毒的仓库把 token 发去攻击者控制的 registry），仓库里那行
+      # `_authToken=${GITEA_PACKAGE_REGISTRY_TOKEN}` 会被整条**忽略**。症状不是
+      # 「变量未展开」而是「没有 auth header」的 401，两者报的是同一个错误码。
+      # 所以下面还有一步把凭据写进用户级配置，那才是真正生效的地方。
+      #
+      # 本地不受影响是因为开发机的 ~/.npmrc 里本来就有这行，一直盖着项目级那行。
       GITEA_PACKAGE_REGISTRY_TOKEN: ${{ secrets.GITEA_ACCESS_TOKEN }}
 
     steps:
@@ -133,6 +139,10 @@ jobs:
       #   run: |
       #     sudo apt-get update
       #     sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Authenticate private npm registry
+        shell: bash
+        run: pnpm config set --global "//gitea.hk.tencent.useforall.com/api/packages/lim/npm/:_authToken" "$GITEA_PACKAGE_REGISTRY_TOKEN"
 
       - run: pnpm install
 
@@ -260,6 +270,9 @@ jobs:
             ~/.gradle/wrapper
           key: gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*') }}
           restore-keys: gradle-
+
+      - name: Authenticate private npm registry
+        run: pnpm config set --global "//gitea.hk.tencent.useforall.com/api/packages/lim/npm/:_authToken" "$GITEA_PACKAGE_REGISTRY_TOKEN"
 
       - run: pnpm install
 
